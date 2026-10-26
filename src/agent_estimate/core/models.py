@@ -1,0 +1,347 @@
+"""Pydantic models for estimation configuration and result dataclasses."""
+
+from __future__ import annotations
+
+import dataclasses
+import enum
+import math
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Annotated, Protocol, runtime_checkable
+
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, StringConstraints, model_validator
+
+NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+# ---------------------------------------------------------------------------
+# Pydantic config models (input validation)
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class AgentProfileProtocol(Protocol):
+    """Runtime plugin protocol for discoverable agent profiles."""
+
+    name: str
+    capabilities: Sequence[str]
+    parallelism: int
+    cost_per_turn: float
+    model_tier: str
+
+    def adjust_estimate(self, minutes: float) -> float:
+        """Optionally adjust an estimate (in minutes) for this profile."""
+
+
+class AgentProfile(BaseModel):
+    """Configuration for one estimation agent profile."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: NonEmptyStr
+    capabilities: list[NonEmptyStr] = Field(min_length=1)
+    parallelism: Annotated[int, Field(ge=1)]
+    cost_per_turn: Annotated[float, Field(ge=0)]
+    model_tier: NonEmptyStr
+    estimate_multiplier: Annotated[float, Field(gt=0, allow_inf_nan=False, strict=True)] = 1.0
+    _adjustment_hook: Callable[[float], float] | None = PrivateAttr(default=None)
+
+    def adjust_estimate(self, minutes: float) -> float:
+        """Adjust work once after assignment; structural plugins retain their hook."""
+        if not math.isfinite(minutes) or minutes < 0:
+            raise ValueError(f"minutes must be finite and >= 0, got {minutes}")
+        if self._adjustment_hook is not None:
+            return self._adjustment_hook(minutes)
+        return float(minutes) * self.estimate_multiplier
+
+
+class ProjectSettings(BaseModel):
+    """Project-level calibration and overhead settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    friction_multiplier: Annotated[float, Field(gt=0)]
+    inter_wave_overhead: Annotated[float, Field(ge=0)]
+    metr_fallback_threshold: Annotated[float, Field(gt=0)]
+
+
+class EstimationConfig(BaseModel):
+    """Top-level config object for estimation inputs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agents: list[AgentProfile] = Field(min_length=1)
+    settings: ProjectSettings
+
+    @model_validator(mode="after")
+    def reject_duplicate_agent_names(self) -> EstimationConfig:
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for agent in self.agents:
+            if agent.name in seen:
+                duplicates.add(agent.name)
+            seen.add(agent.name)
+        if duplicates:
+            names = ", ".join(repr(name) for name in sorted(duplicates))
+            raise ValueError(f"agent names must be unique; duplicates: {names}")
+        return self
+
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
+
+
+class SizeTier(enum.Enum):
+    """Task size classification."""
+
+    XS = "XS"
+    S = "S"
+    M = "M"
+    L = "L"
+    XL = "XL"
+
+
+class TaskType(enum.Enum):
+    """Category of work for human-comparison multipliers."""
+
+    BOILERPLATE = "boilerplate"
+    BUG_FIX = "bug_fix"
+    FEATURE = "feature"
+    REFACTOR = "refactor"
+    TEST = "test"
+    DOCS = "docs"
+    FRONTEND = "frontend"
+    APP_DEV = "app_dev"
+    UNKNOWN = "unknown"
+
+
+class EstimationCategory(enum.Enum):
+    """Top-level task category that determines which estimation model to use.
+
+    CODING       — default; uses PERT tiers (XS-XL) with modifiers
+    BRAINSTORM   — flat model; ~10m independent, ~5m synthesis
+    RESEARCH     — time-boxed; 15-45m depending on depth
+    CONFIG_SRE   — flat + verification; ~15-30m
+    DOCUMENTATION — line-count based; similar to coding but lower floor
+    FRONTEND     — bimodal UI/page model; content patch vs page build
+    APP_DEV      — app-shell/build model; generic cold L prior
+
+    Aliases accepted via ``_missing_``:
+      "sre"        → CONFIG_SRE
+      "config_sre" → CONFIG_SRE
+      "docs"       → DOCUMENTATION
+      "ui"         → FRONTEND
+      "app-dev"    → APP_DEV
+    """
+
+    CODING = "coding"
+    BRAINSTORM = "brainstorm"
+    RESEARCH = "research"
+    CONFIG_SRE = "config"
+    DOCUMENTATION = "documentation"
+    FRONTEND = "frontend"
+    APP_DEV = "app_dev"
+
+    @classmethod
+    def _missing_(cls, value: object) -> EstimationCategory | None:
+        """Accept common aliases for category names."""
+        _aliases: dict[str, EstimationCategory] = {
+            "sre": cls.CONFIG_SRE,
+            "config_sre": cls.CONFIG_SRE,
+            "docs": cls.DOCUMENTATION,
+            "ui": cls.FRONTEND,
+            "front_end": cls.FRONTEND,
+            "front-end": cls.FRONTEND,
+            "web": cls.FRONTEND,
+            "app": cls.APP_DEV,
+            "app-dev": cls.APP_DEV,
+            "appdev": cls.APP_DEV,
+        }
+        if isinstance(value, str):
+            return _aliases.get(value.lower())
+        return None
+
+
+class ReviewMode(enum.Enum):
+    """Code-review overhead model (additive minutes).
+
+    NONE     — self-merge, no cross-agent review (0 m)
+    STANDARD — clean 2x-LGTM, 1-2 rounds        (15 m)
+    COMPLEX  — involved/security-sensitive review (25 m)
+    THREE_ROUND — explicit 3-round cross-agent review (35 m)
+
+    Legacy aliases kept for backwards compatibility:
+      "self"    → NONE (maps to 0 m; was previously 7.5 m)
+      "2x-lgtm" → STANDARD
+    """
+
+    NONE = "none"
+    STANDARD = "standard"
+    COMPLEX = "complex"
+    THREE_ROUND = "3-round"
+
+    @classmethod
+    def _missing_(cls, value: object) -> ReviewMode | None:
+        """Accept legacy CLI values."""
+        _legacy: dict[str, ReviewMode] = {
+            "self": cls.NONE,
+            "2x-lgtm": cls.STANDARD,
+            "three-round": cls.THREE_ROUND,
+            "three_round": cls.THREE_ROUND,
+            "3_round": cls.THREE_ROUND,
+            "3round": cls.THREE_ROUND,
+        }
+        if isinstance(value, str):
+            return _legacy.get(value)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Result dataclasses (frozen, output-only)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PertResult:
+    """Raw PERT computation output."""
+
+    optimistic: float
+    most_likely: float
+    pessimistic: float
+    expected: float
+    sigma: float
+
+
+@dataclass(frozen=True)
+class SizingResult:
+    """Tier assignment with calibrated baselines (minutes)."""
+
+    tier: SizeTier
+    baseline_optimistic: float
+    baseline_most_likely: float
+    baseline_pessimistic: float
+    task_type: TaskType
+    signals: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ModifierSet:
+    """Collected modifiers applied to a baseline estimate."""
+
+    spec_clarity: float  # multiplier (0.3–1.3)
+    warm_context: float  # multiplier (0.3–1.15)
+    agent_fit: float  # multiplier (0.9–1.2)
+    combined: float  # clamped product (floor applied)
+    raw_combined: float  # raw product before floor
+    clamped: bool  # True when floor was applied
+
+
+@dataclass(frozen=True)
+class MetrWarning:
+    """Warning emitted when an estimate exceeds METR p80 threshold."""
+
+    model_key: str
+    threshold_minutes: float
+    estimated_minutes: float
+    message: str
+
+
+@dataclass(frozen=True)
+class TaskEstimate:
+    """Full estimation result for one task."""
+
+    sizing: SizingResult
+    pert: PertResult
+    modifiers: ModifierSet
+    review_minutes: float
+    total_expected_minutes: float
+    human_equivalent_minutes: float | None
+    metr_warning: MetrWarning | None
+    estimation_category: EstimationCategory | None = None
+    estimate_factor: float = 1.0
+    pre_adjustment_minutes: float | None = None
+
+
+# ---------------------------------------------------------------------------
+# Wave planner dataclasses (frozen, output-only)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TaskNode:
+    """Input: one task to be scheduled.
+
+    ``duration_minutes`` is the work-only duration (no review).
+    ``review_minutes`` is the per-task review overhead; the wave planner
+    amortizes this across same-agent tasks in each wave so only a single
+    review cycle is charged per agent per wave.
+    """
+
+    task_id: str
+    duration_minutes: float
+    dependencies: tuple[str, ...] = ()
+    required_capabilities: tuple[str, ...] = ()
+    review_minutes: float = 0.0
+
+
+@dataclass(frozen=True)
+class WaveAssignment:
+    """One task assigned to an agent slot within a wave."""
+
+    task_id: str
+    agent_name: str
+    slot_index: int
+    duration_minutes: float
+    co_dispatch_group: tuple[str, ...] = ()
+    """Task IDs co-dispatched to the same agent in the same wave.
+
+    Non-empty only when two or more tasks are assigned to the same agent within
+    a single wave.  The first task in the group receives no warm-context
+    reduction; subsequent tasks have their ``duration_minutes`` reduced by 0.5x
+    to model implicit warm context carried over from the first task.
+    """
+
+
+@dataclass(frozen=True)
+class Wave:
+    """A single scheduling wave.
+
+    ``agent_review_minutes`` maps each agent to the single amortized review
+    cycle charged for that agent in this wave (0.0 when review_mode is NONE
+    or the agent has no tasks in the wave).
+    """
+
+    wave_number: int
+    start_minutes: float
+    end_minutes: float
+    assignments: tuple[WaveAssignment, ...]
+    agent_review_minutes: Mapping[str, float] = dataclasses.field(default_factory=dict)  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "agent_review_minutes",
+            MappingProxyType(dict(self.agent_review_minutes)),
+        )
+
+
+@dataclass(frozen=True)
+class WavePlan:
+    """Complete wave plan output."""
+
+    waves: tuple[Wave, ...]
+    critical_path: tuple[str, ...]
+    critical_path_minutes: float
+    agent_utilization: Mapping[str, float]
+    parallel_efficiency: float
+    total_wall_clock_minutes: float
+    total_sequential_minutes: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "agent_utilization",
+            MappingProxyType(dict(self.agent_utilization)),
+        )

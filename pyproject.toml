@@ -1,0 +1,86 @@
+[build-system]
+requires = ["hatchling>=1.32,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-estimate"
+version = "0.10.0"
+description = "Know what an AI task will cost before you run it"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [{ name = "Kiloloop" }]
+keywords = ["ai", "agents", "estimation", "pert", "planning", "claude", "codex", "task-planning", "cost-estimation"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+  # 0.16.1 supports Click 8.2 and fixes duplicate no-args help output.
+  "typer>=0.16.1,<1.0",
+  "pyyaml>=6.0.1,<7.0",
+  # 2.5 adds JsonValue, which the trace schema imports.
+  "pydantic>=2.5,<3.0",
+  "networkx>=3.0,<4.0",
+  # direct import (Self on py3.10); align with pydantic 2.5's effective floor
+  "typing-extensions>=4.6.1,<5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9.0.3,<10.0",
+  # minor-capped on purpose: ruff minor releases promote new default rules
+  # (0.16 added ~131 findings overnight) — bump the cap deliberately, with the sweep
+  "ruff>=0.16,<0.17",
+  # tomllib landed in 3.11; the packaging guard parses pyproject as real TOML
+  # so a commented-out or misspelled table fails instead of silently passing.
+  'tomli>=2.0; python_version<"3.11"',
+]
+
+[project.urls]
+Homepage = "https://github.com/kiloloop/agent-estimate"
+Repository = "https://github.com/kiloloop/agent-estimate"
+Issues = "https://github.com/kiloloop/agent-estimate/issues"
+Changelog = "https://github.com/kiloloop/agent-estimate/blob/main/CHANGELOG.md"
+Security = "https://github.com/kiloloop/agent-estimate/security/policy"
+Support = "https://github.com/kiloloop/agent-estimate/blob/main/SUPPORT.md"
+
+[project.scripts]
+agent-estimate = "agent_estimate.cli.app:main"
+
+[tool.hatch.build.targets.sdist]
+# `export-ignore` in .gitattributes only governs `git archive`; hatchling does not
+# honour it, so dev-only files need excluding here too or they ride the sdist.
+# These three leave together: an artifact carrying a test but not its fixture is
+# broken on arrival. `export-ignore` in .gitattributes pins the same set for the
+# other carrier, and the `export-boundary` CI job proves both by building each
+# artifact and running the tests it ships from inside it.
+exclude = [
+  "tests/fixtures/github_issue_mode_regressions.json",
+  "tests/unit/test_issue_mode_regressions.py",
+  "tests/unit/test_packaging.py",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint.flake8-bugbear]
+# typer's Option/Argument-in-default idiom — exempted precisely so B008 stays
+# live for any other call-in-default in the CLI modules
+extend-immutable-calls = ["typer.Option", "typer.Argument"]
+
+[tool.ruff.lint.per-file-ignores]
+# BLE001: CLI boundary handlers catch broadly by design to render friendly errors
+"src/agent_estimate/cli/commands/*.py" = ["BLE001"]
+# BLE001: the check runner is a harness — it must survive any check's failure
+"scripts/preflight.py" = ["BLE001"]
